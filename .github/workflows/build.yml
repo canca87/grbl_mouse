@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact_name: grbl_mouse-linux
+            artifact_path: dist/grbl_mouse
+          - os: windows-latest
+            artifact_name: grbl_mouse-windows
+            artifact_path: dist/grbl_mouse.exe
+          - os: macos-latest
+            artifact_name: grbl_mouse-macos
+            artifact_path: dist/grbl_mouse
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install Linux Tk dependency
+        # Needed for the --gui flag (Tkinter); mirrors the Homebrew
+        # python-tk formula this project's dev setup needs on macOS - Tk
+        # support is a separate package from Python itself on several
+        # platforms, not something `pip install` can add.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Build
+        run: pyinstaller -y grbl_mouse.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/grbl_mouse-linux/grbl_mouse
+            artifacts/grbl_mouse-windows/grbl_mouse.exe
+            artifacts/grbl_mouse-macos/grbl_mouse

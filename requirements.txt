@@ -1,0 +1,4 @@
+# Runtime dependencies — proposed, not yet installed.
+# See CLAUDE.md: every `pip install` is confirmed explicitly before running.
+hidapi       # cross-platform raw HID access (cython-hidapi bindings, module `hid`), for hid_input/
+pyserial     # GRBL serial link, for grbl_link/

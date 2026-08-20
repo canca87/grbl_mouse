@@ -1,0 +1,3 @@
+# Dev-only dependencies — proposed, not yet installed.
+# See CLAUDE.md: every `pip install` is confirmed explicitly before running.
+pytest
