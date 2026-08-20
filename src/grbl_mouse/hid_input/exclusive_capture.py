@@ -1,13 +1,21 @@
 """Milestone M3: hardware-confirmed OS pointer detachment via plain open().
 
-Confirmed on the real device (macOS): opening the "Mouse" collection via
-HidApiBackend already seizes it from the OS pointer pipeline — the system
-cursor stops responding to the trackball/buttons while this tool holds the
-device open, and normal behavior returns as soon as it's closed (Ctrl+C or
-otherwise, via the `finally` block below). No separate grab/seize logic was
-needed beyond HidApiBackend's default open() behavior. See
-hidapi_backend.py for the note on why, and re-verify this assumption when
-Windows/Linux backends are added later.
+Confirmed on macOS: opening the "Mouse" collection via `hidapi_backend.py`
+already seizes it from the OS pointer pipeline — the system cursor stops
+responding to the trackball/buttons while this tool holds the device open,
+and normal behavior returns as soon as it's closed (Ctrl+C or otherwise,
+via the `finally` block below). No separate grab/seize logic was needed
+there beyond hidapi's default open() behavior.
+
+This does NOT hold on Windows — confirmed by a real hardware bug report:
+`hidapi`'s CreateFile-based access there doesn't preempt the OS's own
+mouse-class driver, so the device keeps working as a normal system pointer
+the whole time, and reading it concurrently can fail outright. Windows uses
+a different backend entirely (win32_raw_input_backend.py, selected
+automatically by backend_factory.py) which achieves detachment via
+RegisterRawInputDevices/RIDEV_NOLEGACY instead — see that module's
+docstring, including its "affects all mice on the system, not just this
+one" caveat, which has no equivalent on macOS.
 
 This tool just holds the device open and reads continuously, identically to
 debug_dump.py's read loop, but is framed around confirming that behavior
@@ -26,11 +34,11 @@ import argparse
 import sys
 
 from . import cli_common
-from .backend import HidDeviceInfo
-from .hidapi_backend import HidApiBackend
+from .backend import HidBackend, HidDeviceInfo
+from .backend_factory import make_hid_backend
 
 
-def _run_capture_test(backend: HidApiBackend, device: HidDeviceInfo, index: int) -> None:
+def _run_capture_test(backend: HidBackend, device: HidDeviceInfo, index: int) -> None:
     print(f"Opening {cli_common.format_device(index, device)}\n")
     backend.open(device)
     print("Device is open and being read continuously.")
@@ -60,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     cli_common.add_device_selection_args(parser)
     args = parser.parse_args(argv)
 
-    backend = HidApiBackend()
+    backend = make_hid_backend()
     devices, selected_index = cli_common.resolve_selected_device(backend, args)
 
     if not devices:

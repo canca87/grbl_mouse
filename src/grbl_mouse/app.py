@@ -69,8 +69,8 @@ from .grbl_link.serial_link import GrblAlarm, GrblError, GrblReset, SerialLink, 
 from .grbl_link.status import query_status
 from .grbl_link.velocity_jog import CancelAction, SendAction, VelocityJogController
 from .hid_input import cli_common
-from .hid_input.backend import HidDeviceInfo
-from .hid_input.hidapi_backend import HidApiBackend
+from .hid_input.backend import HidBackend, HidDeviceInfo
+from .hid_input.backend_factory import make_hid_backend
 from .hid_input.report_parser import BUTTON_TOP_LEFT, decode
 from .presets import (
     FIXED_FEEDRATE,
@@ -157,7 +157,7 @@ def _select_hid_device(
     way of aborting a wait without relying on KeyboardInterrupt, which
     doesn't reliably interrupt a background thread).
     """
-    devices = HidApiBackend().list_devices()
+    devices = make_hid_backend().list_devices()
     matches = _matching_hid_devices(
         devices,
         vendor_id=args.hid_vendor,
@@ -195,7 +195,7 @@ def _select_hid_device(
 
 def _hid_device_present(args: argparse.Namespace) -> bool:
     matches = _matching_hid_devices(
-        HidApiBackend().list_devices(),
+        make_hid_backend().list_devices(),
         vendor_id=args.hid_vendor,
         product_id=args.hid_product,
         usage_page=args.hid_usage_page,
@@ -216,7 +216,7 @@ def _wait_for_hid_reconnect(
         if stop_event is not None and stop_event.is_set():
             return None
         matches = _matching_hid_devices(
-            HidApiBackend().list_devices(),
+            make_hid_backend().list_devices(),
             vendor_id=args.hid_vendor,
             product_id=args.hid_product,
             usage_page=args.hid_usage_page,
@@ -236,7 +236,7 @@ def _wait_for_hid_reconnect(
         time.sleep(HID_RECONNECT_POLL_S)
 
 
-def _read_poll_reports(hid_backend: HidApiBackend, poll_interval: float) -> list[bytes]:
+def _read_poll_reports(hid_backend: HidBackend, poll_interval: float) -> list[bytes]:
     """Collect HID reports arriving within one bounded poll window."""
     reports: list[bytes] = []
     deadline = time.monotonic() + poll_interval
@@ -262,7 +262,7 @@ def _safe_cancel(link: SerialLink) -> None:
         pass
 
 
-def _safe_close_hid(hid_backend: HidApiBackend) -> None:
+def _safe_close_hid(hid_backend: HidBackend) -> None:
     try:
         hid_backend.close()
     except Exception:
@@ -272,10 +272,10 @@ def _safe_close_hid(hid_backend: HidApiBackend) -> None:
 def _handle_hid_disconnect(
     args: argparse.Namespace,
     link: SerialLink,
-    hid_backend: HidApiBackend,
+    hid_backend: HidBackend,
     emit: Callable[[str], None] = print,
     stop_event: threading.Event | None = None,
-) -> tuple[HidApiBackend, ButtonPressDetector, VelocityJogController] | None:
+) -> tuple[HidBackend, ButtonPressDetector, VelocityJogController] | None:
     """Cancel any active jog, close the (now-dead) HID handle, wait for a
     matching device to reappear, and return a fresh backend/detector/
     controller for it. Shared by both the proactive periodic check and the
@@ -290,7 +290,7 @@ def _handle_hid_disconnect(
     device_info = _wait_for_hid_reconnect(args, emit=emit, stop_event=stop_event)
     if device_info is None:
         return None
-    new_backend = HidApiBackend()
+    new_backend = make_hid_backend()
     new_backend.open(device_info)
     emit("HID device reconnected. Resuming.\n")
     return new_backend, ButtonPressDetector(), VelocityJogController(deadman_timeout=args.deadman_timeout)
@@ -531,7 +531,7 @@ def run_gui_worker(
     device_info = _select_hid_device(args, emit=emit, stop_event=stop_event)
     if device_info is None:
         return
-    hid_backend = HidApiBackend()
+    hid_backend = make_hid_backend()
     hid_backend.open(device_info)
 
     connected = _connect_to_grbl(args, emit=emit, stop_event=stop_event)
@@ -713,7 +713,7 @@ def _run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nAborted waiting for HID device.")
         return 1
-    hid_backend = HidApiBackend()
+    hid_backend = make_hid_backend()
     hid_backend.open(device_info)
 
     try:

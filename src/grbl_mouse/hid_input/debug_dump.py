@@ -21,11 +21,11 @@ import argparse
 import sys
 
 from . import cli_common
-from .backend import HidDeviceInfo
-from .hidapi_backend import HidApiBackend
+from .backend import HidBackend, HidDeviceInfo
+from .backend_factory import make_hid_backend
 
 
-def _dump_reports(backend: HidApiBackend, device: HidDeviceInfo, index: int) -> None:
+def _dump_reports(backend: HidBackend, device: HidDeviceInfo, index: int) -> None:
     print(f"Opening {cli_common.format_device(index, device)}")
     print("Reading raw reports. Move the ball, scroll the wheel, press buttons.")
     print("Press Ctrl+C to stop.\n")
@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     cli_common.add_device_selection_args(parser)
     args = parser.parse_args(argv)
 
-    backend = HidApiBackend()
+    backend = make_hid_backend()
     devices, selected_index = cli_common.resolve_selected_device(backend, args)
 
     if not devices:

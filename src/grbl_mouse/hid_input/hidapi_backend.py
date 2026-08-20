@@ -11,9 +11,15 @@ Confirmed on macOS (milestone M3, hardware-verified): opening a device via
 device stops driving the system cursor/clicks, and closing it (including
 via the `finally` blocks in the CLI tools) restores normal behavior. No
 separate "exclusive grab" mechanism was needed beyond this default `open()`
-behavior. This has not yet been verified on Windows/Linux; when those
-backends are added, re-confirm this assumption rather than carrying it over
-unchecked.
+behavior. Unverified on Linux.
+
+Confirmed NOT to hold on Windows, via a real hardware bug report: opening
+the device here doesn't preempt the OS's own mouse-class driver the way
+macOS's IOHIDManager does, so the device keeps working as a normal system
+pointer, and concurrent reads can fail outright. `backend_factory.py`
+routes Windows to `win32_raw_input_backend.py` instead, which uses a
+different Win32-specific mechanism — this module is only ever selected on
+macOS/Linux.
 """
 
 from __future__ import annotations

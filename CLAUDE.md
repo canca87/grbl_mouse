@@ -12,9 +12,26 @@ drives the stage over serial using GRBL's `$J=` jog syntax.
 Architecture:
 
 - `src/grbl_mouse/hid_input/` — raw HID access (platform-abstracted `backend.py`
-  protocol + `hidapi_backend.py` implementation) and report decoding
-  (`report_parser.py`: dx/dy/wheel/buttons). `cli_common.py` holds shared
-  device-selection logic for the `debug_*` inspection tools in this package.
+  protocol), report decoding (`report_parser.py`: dx/dy/wheel/buttons), and platform
+  selection (`backend_factory.py`, used by every call site instead of instantiating a
+  concrete backend directly — see below for why this matters). `cli_common.py` holds
+  shared device-selection logic for the `debug_*` inspection tools in this package.
+  - `hidapi_backend.py` (macOS/Linux) — the cross-platform `hidapi` library.
+  - `win32_raw_input_backend.py` + `win32_translate.py` (Windows) — a real hardware bug
+    report showed `hidapi`'s approach doesn't work on Windows the way it does on macOS:
+    opening the device there doesn't preempt the OS's own mouse-class driver, so the
+    device keeps working as a normal system pointer and concurrent raw reads can fail
+    outright (this manifested as an infinite HID disconnect/reconnect loop). Windows
+    needs the Raw Input API (`RegisterRawInputDevices`/`RIDEV_NOLEGACY`) instead — a
+    completely different mechanism, exactly as this project's original brief specified.
+    `win32_translate.py` is the pure, unit-tested translation of Windows'
+    already-semantically-parsed `RAWMOUSE` data back into the same 4-byte report format
+    `report_parser.py` expects everywhere else; `win32_raw_input_backend.py` is the
+    ctypes/Win32 plumbing around it, which — being genuinely untestable without a
+    Windows machine — carries real unverified assumptions (button-bit mapping, wheel
+    scaling) documented in its own docstring. **`RIDEV_NOLEGACY` affects the whole
+    Mouse usage class, not just this device** — while this backend is open, every mouse
+    on the system loses normal pointer behavior, not only the target Expert Mouse.
 - `src/grbl_mouse/grbl_link/` — serial connection handling (`transport.py` protocol +
   `pyserial_transport.py`), GRBL response parsing (`serial_link.py`: `ok`/`error`/
   `ALARM`/a mid-session reset), status queries (`status.py`), jog command dispatch
@@ -89,8 +106,12 @@ extension into an existing interpreter.
 
 macOS is the primary dev target, but Windows and Linux are later deployment targets
 (built via GitHub Actions). New HID or serial code should go through the
-`hid_input/backend.py` abstraction rather than calling platform-specific APIs directly
-from application logic, even though only the macOS backend is implemented today.
+`hid_input/backend.py` abstraction (via `backend_factory.py`'s `make_hid_backend()` —
+never instantiate `HidApiBackend`/`Win32RawInputBackend` directly in application code)
+rather than calling platform-specific APIs directly. This paid off concretely: macOS's
+"opening the device already detaches it from the OS pointer pipeline" behavior turned
+out not to hold on Windows at all (see the architecture section above), and the fix was
+a second backend behind the same interface, not a rewrite of anything that calls it.
 
 ## Testing conventions
 
@@ -118,10 +139,16 @@ from application logic, even though only the macOS backend is implemented today.
 
 ## Open items
 
-- Windows/Linux HID backends are not implemented — `hid_input/backend.py` is
-  platform-abstracted for this, but only `hidapi_backend.py` (works cross-platform via
-  the `hidapi` package) exists so far, and M3's "opening the device already detaches it
-  from the OS pointer pipeline" behavior is confirmed on macOS only.
-- Cross-platform packaging (PyInstaller + GitHub Actions) is unverified beyond "it
-  builds" — no Windows/Linux hardware has been available to test the resulting binaries
-  against real HID/serial devices.
+- Linux has no dedicated HID backend yet — falls back to `hidapi_backend.py` (same as
+  macOS), unverified on real Linux hardware. If it turns out to have the same
+  driver-contention problem Windows did, it'll need its own backend behind
+  `backend_factory.py` too, same pattern as `win32_raw_input_backend.py`.
+- The Windows Raw Input backend (`win32_raw_input_backend.py`) was written with zero
+  Windows access at all — no machine to test on, ever. Its own docstring and
+  `win32_translate.py`'s docstring both document the specific unverified assumptions
+  (button-bit mapping, wheel-delta scaling) in detail; check those first if Windows
+  behavior looks wrong. `GRBL_MOUSE_WIN32_DEBUG=1` prints raw pre-translation data to
+  help diagnose which assumption is off in one test pass rather than several.
+- Cross-platform packaging (PyInstaller + GitHub Actions) builds successfully
+  (verified with a local macOS build) but is otherwise unverified — no Windows/Linux
+  hardware has been available to test the resulting binaries against real devices.

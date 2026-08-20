@@ -32,16 +32,34 @@ configuration.
 Core functionality (HID input, GRBL link, jog dispatch, CLI, GUI) is done and
 hardware-confirmed on the reference macOS setup described below. Cross-platform
 packaging ([.github/workflows/build.yml](.github/workflows/build.yml), builds tagged
-releases for Linux/Windows/macOS via PyInstaller) builds successfully — verified with a
-local macOS test build — but the Windows/Linux binaries haven't been run against real
-HID/serial hardware; only macOS has. Summary of what's confirmed:
+releases for Linux/Windows/macOS via PyInstaller) builds successfully on all three
+platforms, but only macOS has been run against real HID/serial hardware — Windows
+specifically needed real platform-specific work, not just "it should work the same":
+
+> **Windows note**: opening this device the way macOS does (which detaches it from the
+> OS pointer pipeline for free) does *not* work on Windows — the device keeps working as
+> a normal system mouse the whole time, and reading it concurrently can fail outright.
+> Windows uses a different mechanism entirely
+> ([win32_raw_input_backend.py](src/grbl_mouse/hid_input/win32_raw_input_backend.py),
+> the Raw Input API with `RIDEV_NOLEGACY`, exactly as this project's original brief
+> specified), written and reasoned through from a bug report alone — **no Windows
+> machine was available to test any of it**. If jog input looks wrong on Windows (wrong
+> button, wrong direction, Z-axis way too sensitive or dead), that module's docstring
+> and [win32_translate.py](src/grbl_mouse/hid_input/win32_translate.py)'s docstring both
+> document the specific unverified assumptions to check first. Set
+> `GRBL_MOUSE_WIN32_DEBUG=1` to print raw pre-translation data to stderr. Also note:
+> `RIDEV_NOLEGACY` affects the whole Mouse usage class, not just this device — while the
+> app is running, *every* mouse on the system loses normal pointer behavior, not only
+> the target Expert Mouse.
 
 - **HID layer** ([hid_input/](src/grbl_mouse/hid_input/)): Kensington Expert Mouse
   (VID=0x047d PID=0x1020) confirmed; it exposes two HID collections sharing the same
   VID/PID — `usage=0x02` ("Mouse", the real input) and `usage=0x01` ("Pointer", an
-  unrelated telemetry stream). Raw report layout, exclusive-capture behavior (opening
-  the device already detaches it from the OS pointer pipeline, no extra code needed),
-  and multi-device disambiguation (`--hid-serial`) are all hardware-verified.
+  unrelated telemetry stream). Raw report layout and multi-device disambiguation
+  (`--hid-serial`, macOS/Linux only — Raw Input doesn't expose HID serial numbers on
+  Windows) are hardware-verified. Exclusive-capture (detaching the device from the OS
+  pointer pipeline) is hardware-confirmed on macOS; Windows uses a different mechanism,
+  see the note above.
 - **GRBL link** ([grbl_link/](src/grbl_mouse/grbl_link/)): serial handshake, status
   polling, jog dispatch (`$J=`, `$X`, jog-cancel), and alarm-code awareness
   (`ALARM_DESCRIPTIONS` in [serial_link.py](src/grbl_mouse/grbl_link/serial_link.py))
