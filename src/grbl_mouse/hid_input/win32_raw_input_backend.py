@@ -11,11 +11,12 @@ intermittently. That's what a real hardware bug report on Windows showed:
 an infinite HID disconnect/reconnect loop, since `hid_read()` kept raising
 errors and the code (correctly, per its own logic) kept treating that as
 the device having been unplugged. This project's own original brief
-anticipated exactly this, specifying RegisterRawInputDevices with
-RIDEV_NOLEGACY as the Windows-specific mechanism — which is what this
-module implements.
+anticipated exactly this, specifying RegisterRawInputDevices as the
+Windows-specific mechanism — which is what this module implements, via
+RIDEV_INPUTSINK (deliberately WITHOUT RIDEV_NOLEGACY — see point 2 below
+for why that flag was tried, then removed).
 
-Two distinct Windows-specific things to know, found via real hardware testing:
+Three distinct Windows-specific things to know, found via real hardware testing:
 
 1. RegisterRawInputDevices(RIDEV_INPUTSINK) only lets you register for an
    entire HID usage class (Generic Desktop / Mouse) — there is no API to
@@ -27,35 +28,57 @@ Two distinct Windows-specific things to know, found via real hardware testing:
    RAWINPUTHEADER.hDevice handle for the selected device at open() time
    and drop every event that doesn't match it — this is required, not
    optional, for correct/safe operation.
-2. RIDEV_NOLEGACY does NOT stop the Expert Mouse from also continuing to
-   work as a normal system pointer while this backend is open — the
-   on-screen cursor keeps moving and clicking normally the whole time raw
-   jog data is also being captured correctly (confirmed via a standalone
-   .NET Raw Input probe, independent of this module). This contradicts
-   what the docs originally assumed (that NOLEGACY would detach the device
-   the way macOS's IOHIDManager exclusive-open does) — in reality,
-   NOLEGACY only suppresses legacy WM_MOUSEMOVE/WM_*BUTTONDOWN *messages*
-   to other windows; it does not touch the separate, lower-level mechanism
-   that actually renders/moves the cursor. There is no supported
-   per-device way to fix this on Windows: the system cursor is a single
-   resource shared by every connected mouse, and the only APIs that
-   pin/hide it (ClipCursor/ShowCursor) act on that shared cursor, not on
-   any one device — using them here would also freeze/hide the cursor for
-   every *other* mouse on the machine, which was tested and explicitly
-   rejected for that reason. This is deliberately NOT implemented; the
-   Expert Mouse simply continues to behave as a normal pointer (visually)
-   alongside delivering jog data — item 1 above is what keeps *other*
-   mice's movement from being mistaken for jog input, this item is purely
-   about the Expert Mouse's own on-screen cursor behavior, which is
-   unaffected either way. If a genuine future need for true per-device
-   cursor detachment on Windows comes up, the real fix is a driver swap
-   (e.g. via Zadig/WinUSB) so Windows never binds the inbox HID-mouse
-   driver to this device at all, paired with a rewrite of this module to
-   talk WinUSB directly instead of Raw Input — a significantly bigger
-   effort than anything here, not started. The actual long-term plan for
-   true per-device detachment is Linux (see backend_factory.py's TODO /
-   CLAUDE.md's open items): evdev's EVIOCGRAB ioctl genuinely does support
-   single-device exclusive grab, unlike anything Windows offers.
+2. RIDEV_NOLEGACY (tried first, since it's what the original brief and
+   MSDN's own description suggested) was REMOVED after two real hardware
+   findings. First: it does NOT stop the Expert Mouse from also continuing
+   to work as a normal system pointer while this backend is open — the
+   on-screen cursor keeps moving/clicking normally the whole time raw jog
+   data is also being captured correctly (confirmed via a standalone .NET
+   Raw Input probe, independent of this module) — NOLEGACY only suppresses
+   legacy mouse *messages*, it does not touch the separate, lower-level
+   mechanism that actually renders/moves the cursor, so it never achieved
+   the per-device detachment it was added for. Second, and worse: with
+   `--gui`, NOLEGACY made the Tkinter window permanently unresponsive to
+   ALL mouse input (unclickable, undraggable, uncloseable via the X
+   button) from the moment it opened, regardless of trackball activity —
+   status text kept updating fine (driven by WM_TIMER via Tk's `.after()`,
+   unrelated to mouse messages), but no mouse click of any kind reached
+   the window. RIDEV_NOLEGACY's legacy-message suppression appears to
+   apply per-application (or at least per message queue), not just to the
+   specific hwndTarget window that registered it — so it silently broke
+   the *other* window (the GUI) belonging to the same process. Given it
+   provided no working benefit (see above) while causing this real
+   regression, it's been dropped entirely; RIDEV_INPUTSINK alone is
+   sufficient for WM_INPUT delivery and doesn't have either problem. There
+   is no supported per-device way to achieve true cursor detachment on
+   Windows: the system cursor is a single resource shared by every
+   connected mouse, and the only APIs that pin/hide it (ClipCursor/
+   ShowCursor) act on that shared cursor, not on any one device — using
+   them here would also freeze/hide the cursor for every *other* mouse on
+   the machine, which was tested and explicitly rejected for that reason.
+   The Expert Mouse simply continues to behave as a normal pointer
+   (visually) alongside delivering jog data — item 1 above is what keeps
+   *other* mice's movement from being mistaken for jog input; this item is
+   purely about the Expert Mouse's own on-screen cursor behavior, which no
+   flag combination here changes either way. If a genuine future need for
+   true per-device cursor detachment on Windows comes up, the real fix is
+   a driver swap (e.g. via Zadig/WinUSB) so Windows never binds the inbox
+   HID-mouse driver to this device at all, paired with a rewrite of this
+   module to talk WinUSB directly instead of Raw Input — a significantly
+   bigger effort than anything here, not started. The actual long-term
+   plan for true per-device detachment is Linux (see backend_factory.py's
+   TODO / CLAUDE.md's open items): evdev's EVIOCGRAB ioctl genuinely does
+   support single-device exclusive grab, unlike anything Windows offers.
+3. The GUI freeze in point 2 was initially misdiagnosed as GIL/thread-
+   scheduler contention from the raw-input message-loop thread firing a
+   Python callback per HID report (gui.py's shortened sys.setswitchinterval
+   and this module's SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL) call
+   were added for that theory). Real hardware testing ruled it out: the
+   freeze was present immediately on launch and totally independent of
+   trackball activity, which a per-event-contention theory can't explain.
+   Both mitigations are harmless and left in place (shorter GIL switch
+   interval and lower thread priority have no real downside), but the
+   actual fix was removing RIDEV_NOLEGACY per point 2.
 
 See win32_translate.py for how Windows' already-parsed RAWMOUSE data gets
 turned back into the same 4-byte report format report_parser.py expects on
@@ -311,6 +334,14 @@ user32.DispatchMessageW.restype = ctypes.c_ssize_t
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
+kernel32.GetCurrentThread.argtypes = []
+kernel32.GetCurrentThread.restype = wintypes.HANDLE
+
+kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+kernel32.SetThreadPriority.restype = wintypes.BOOL
+
+THREAD_PRIORITY_BELOW_NORMAL = -1
+
 
 def _get_device_name(hdevice: wintypes.HANDLE) -> str:
     size = wintypes.UINT(0)
@@ -423,8 +454,9 @@ def _find_device_handle(name: str) -> wintypes.HANDLE | None:
 
 class Win32RawInputBackend:
     """HidBackend implementation using Windows' Raw Input API. See the
-    module docstring for why this exists instead of using `hidapi` here
-    too, and for the RIDEV_NOLEGACY-affects-all-mice caveat.
+    module docstring for why this exists instead of using `hidapi` here,
+    why RIDEV_NOLEGACY was tried and then removed, and the per-device event
+    filtering this class relies on to ignore other mice on the machine.
     """
 
     def __init__(self) -> None:
@@ -526,6 +558,14 @@ class Win32RawInputBackend:
         self._reports.put(report)
 
     def _message_loop(self) -> None:
+        # Nudge OS scheduling in favor of the main/GUI thread. Real hardware
+        # report: on Windows, the Tkinter GUI froze solid (unclickable,
+        # unclosable - the OS "not responding" state) while this thread was
+        # actively firing a Python callback per HID report during a fast
+        # trackball spin, starving the main thread's own message pump.
+        # Paired with the shorter GIL switch interval set in gui.py.
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+
         wndproc = WNDPROC(self._wndproc)
         self._wndproc_ref = wndproc  # prevent garbage collection while registered
 
@@ -550,7 +590,7 @@ class Win32RawInputBackend:
         rid = RAWINPUTDEVICE(
             usUsagePage=HID_USAGE_PAGE_GENERIC,
             usUsage=HID_USAGE_GENERIC_MOUSE,
-            dwFlags=RIDEV_NOLEGACY | RIDEV_INPUTSINK,
+            dwFlags=RIDEV_INPUTSINK,  # deliberately NOT RIDEV_NOLEGACY - see module docstring
             hwndTarget=hwnd,
         )
         registered = user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
@@ -571,9 +611,8 @@ class Win32RawInputBackend:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-        # Unregister so RIDEV_NOLEGACY stops suppressing legacy mouse
-        # messages system-wide the moment we're done, not just when the
-        # process exits.
+        # Unregister so this process stops receiving WM_INPUT for the Mouse
+        # usage class the moment we're done, not just when the process exits.
         unregister = RAWINPUTDEVICE(
             usUsagePage=HID_USAGE_PAGE_GENERIC,
             usUsage=HID_USAGE_GENERIC_MOUSE,

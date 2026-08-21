@@ -22,8 +22,8 @@ Architecture:
     opening the device there doesn't preempt the OS's own mouse-class driver, so the
     device keeps working as a normal system pointer and concurrent raw reads can fail
     outright (this manifested as an infinite HID disconnect/reconnect loop). Windows
-    needs the Raw Input API (`RegisterRawInputDevices`/`RIDEV_NOLEGACY`) instead — a
-    completely different mechanism, exactly as this project's original brief specified.
+    needs the Raw Input API (`RegisterRawInputDevices`) instead — a completely different
+    mechanism, exactly as this project's original brief specified.
     `win32_translate.py` is the pure, unit-tested translation of Windows'
     already-semantically-parsed `RAWMOUSE` data back into the same 4-byte report format
     `report_parser.py` expects everywhere else; `win32_raw_input_backend.py` is the
@@ -32,14 +32,21 @@ Architecture:
     wheel-delta scaling are all correct — see that module's docstring for what was
     actually found and fixed (a real bug: Windows classifies HID mice as
     `RIM_TYPEMOUSE`, whose info struct has no VID/PID field at all — that has to be
-    parsed from the device name string instead). **`RIDEV_NOLEGACY` does NOT detach the
-    device from the OS pointer pipeline** — confirmed on real hardware, the Expert Mouse
-    keeps working as a normal system pointer the whole time, alongside delivering
-    correct jog data. This is a deliberate, accepted tradeoff (see that module's
-    docstring for why the alternative — `ClipCursor`/`ShowCursor` — was rejected: those
-    act on the single shared system cursor, not per-device, and would have frozen every
-    *other* mouse on the machine too). Not yet verified: jog dispatch (`$J=` sending)
-    through the compiled `.exe` end-to-end with motion enabled.
+    parsed from the device name string instead). Registration deliberately does NOT use
+    `RIDEV_NOLEGACY`, only `RIDEV_INPUTSINK` — see that module's docstring for the two
+    real hardware findings that killed it: it never actually detached the Expert Mouse
+    from the OS pointer pipeline (confirmed: the cursor kept moving/clicking normally the
+    whole time), and worse, with `--gui` it made the Tkinter window permanently
+    unresponsive to all mouse input (unclickable, uncloseable) from the moment it opened
+    — its legacy-message suppression applies per-application, not just to the specific
+    window that registered it, so it silently broke the GUI's own window. Given it
+    provided no working benefit while causing that regression, it was dropped entirely.
+    The dual-pointer behavior (Expert Mouse keeps working as a normal system pointer
+    alongside delivering jog data) is a deliberate, accepted tradeoff either way (see
+    that module's docstring for why the alternative — `ClipCursor`/`ShowCursor` — was
+    rejected: those act on the single shared system cursor, not per-device, and would
+    have frozen every *other* mouse on the machine too). Not yet verified: jog dispatch
+    (`$J=` sending) through the compiled `.exe` end-to-end with motion enabled.
 - `src/grbl_mouse/grbl_link/` — serial connection handling (`transport.py` protocol +
   `pyserial_transport.py`), GRBL response parsing (`serial_link.py`: `ok`/`error`/
   `ALARM`/a mid-session reset), status queries (`status.py`), jog command dispatch
@@ -178,6 +185,21 @@ a second backend behind the same interface, not a rewrite of anything that calls
   if something still looks off. Not yet verified: jog dispatch (`$J=` sending) through
   the compiled `.exe` end-to-end with motion enabled — only read-only HID capture has
   been hardware-tested on Windows so far.
+- Windows `--gui` froze solid (unclickable/undraggable/uncloseable, the OS-level "not
+  responding" state) from the moment the window opened, regardless of trackball
+  activity — status text kept updating fine the whole time (driven by `WM_TIMER` via
+  Tk's `.after()`, unaffected), and jog dispatch itself worked correctly. First
+  diagnosed (wrongly) as GIL/scheduler contention from the raw-input thread firing a
+  Python callback per HID report; that theory was ruled out once hardware testing showed
+  the freeze was constant and independent of mouse activity. **Real root cause**:
+  `RIDEV_NOLEGACY` — its legacy-mouse-message suppression turned out to apply
+  per-application, not just to the specific window that registered it, so it silently
+  broke the GUI's own separate Tkinter window in the same process. Fixed by dropping
+  `RIDEV_NOLEGACY` entirely (see the architecture section above and that module's
+  docstring) — `RIDEV_INPUTSINK` alone is sufficient for `WM_INPUT` delivery and has
+  neither problem. The two speculative GIL-contention mitigations
+  (`sys.setswitchinterval` in `gui.py`, `SetThreadPriority` in the message-loop thread)
+  are harmless and left in place, but were not the actual fix.
 - Cross-platform packaging (PyInstaller + GitHub Actions) builds successfully
   (verified with a local macOS build) but is otherwise unverified — no Windows/Linux
   hardware has been available to test the resulting binaries against real devices.

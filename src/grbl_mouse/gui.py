@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -280,6 +281,15 @@ class GrblMouseGui:
 
 
 def run_gui(args: argparse.Namespace) -> int:
+    # Shorten the GIL's default 5ms switch interval so a busy background
+    # thread can't hold it long enough to make the main thread's Tk event
+    # loop miss Windows' "not responding" watchdog. Real hardware report:
+    # on Windows, the GUI froze solid (unclickable, unclosable) while
+    # actively jogging - the win32 raw input backend's message-loop thread
+    # fires a Python callback per HID report, and a fast trackball spin can
+    # produce many in quick succession, each briefly holding the GIL. This
+    # is cheap and harmless on every platform, so it's not Windows-gated.
+    sys.setswitchinterval(0.001)
     root = tk.Tk()
     GrblMouseGui(root, args)
     root.mainloop()
