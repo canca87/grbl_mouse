@@ -160,7 +160,13 @@ a second backend behind the same interface, not a rewrite of anything that calls
   correlating the two device nodes for the same physical device via sysfs.
 - Windows (`win32_raw_input_backend.py`): enumeration, button-bit mapping, and
   wheel-delta scaling are now hardware-confirmed correct (see that module's docstring).
-  **Known, accepted limitation**: the Expert Mouse continues to behave as a normal
+  A real hardware bug found and fixed in the first Windows build: `RegisterRawInputDevices`
+  can only register for the whole Mouse usage class, not a single device, so WM_INPUT
+  fired for every mouse on the machine — moving an unrelated PC mouse was driving jog
+  motion too. Fixed by resolving and storing the selected device's specific `hDevice`
+  handle at `open()` time and filtering every event against it
+  (`_find_device_handle()`); this filtering is required for safe operation, not
+  optional. **Known, accepted limitation, separate from the above**: the Expert Mouse continues to behave as a normal
   system pointer on Windows the whole time it's also delivering jog data — Windows has
   no supported per-device way to stop this (`RIDEV_NOLEGACY` doesn't touch cursor
   rendering; `ClipCursor`/`ShowCursor` act on the single shared system cursor and would

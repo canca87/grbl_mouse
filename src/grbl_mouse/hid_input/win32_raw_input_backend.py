@@ -15,33 +15,47 @@ anticipated exactly this, specifying RegisterRawInputDevices with
 RIDEV_NOLEGACY as the Windows-specific mechanism — which is what this
 module implements.
 
-Important, hardware-confirmed limitation: RIDEV_NOLEGACY does NOT stop the
-Expert Mouse from also continuing to work as a normal system pointer while
-this backend is open — real hardware testing (a standalone .NET Raw Input
-probe, independent of this module) showed the on-screen cursor keeps
-moving and clicking normally the whole time raw jog data is also being
-captured correctly. This contradicts what the docs originally assumed
-(that NOLEGACY would detach the device the way macOS's IOHIDManager
-exclusive-open does) — in reality, NOLEGACY only suppresses legacy
-WM_MOUSEMOVE/WM_*BUTTONDOWN *messages* to other windows; it does not touch
-the separate, lower-level mechanism that actually renders/moves the
-cursor. There is no supported per-device way to fix this on Windows: the
-system cursor is a single resource shared by every connected mouse, and
-the only APIs that pin/hide it (ClipCursor/ShowCursor) act on that shared
-cursor, not on any one device — using them here would also freeze/hide
-the cursor for every *other* mouse on the machine, which was tested and
-explicitly rejected for that reason. This is deliberately NOT implemented;
-the Expert Mouse simply continues to behave as a normal pointer alongside
-delivering jog data, and other connected mice are completely unaffected.
-If a genuine future need for true per-device detachment on Windows comes
-up, the real fix is a driver swap (e.g. via Zadig/WinUSB) so Windows never
-binds the inbox HID-mouse driver to this device at all, paired with a
-rewrite of this module to talk WinUSB directly instead of Raw Input — a
-significantly bigger effort than anything here, not started. The actual
-long-term plan for true per-device detachment is Linux (see
-backend_factory.py's TODO / CLAUDE.md's open items): evdev's EVIOCGRAB
-ioctl genuinely does support single-device exclusive grab, unlike
-anything Windows offers.
+Two distinct Windows-specific things to know, found via real hardware testing:
+
+1. RegisterRawInputDevices(RIDEV_INPUTSINK) only lets you register for an
+   entire HID usage class (Generic Desktop / Mouse) — there is no API to
+   register for a single physical device. That means WM_INPUT fires for
+   EVERY mouse on the machine, not just the Expert Mouse. A real hardware
+   bug confirmed this: without filtering, moving an entirely separate,
+   unrelated PC mouse also drove jog motion. list_raw_input_mice() /
+   open() / _handle_wm_input() below resolve and store the specific
+   RAWINPUTHEADER.hDevice handle for the selected device at open() time
+   and drop every event that doesn't match it — this is required, not
+   optional, for correct/safe operation.
+2. RIDEV_NOLEGACY does NOT stop the Expert Mouse from also continuing to
+   work as a normal system pointer while this backend is open — the
+   on-screen cursor keeps moving and clicking normally the whole time raw
+   jog data is also being captured correctly (confirmed via a standalone
+   .NET Raw Input probe, independent of this module). This contradicts
+   what the docs originally assumed (that NOLEGACY would detach the device
+   the way macOS's IOHIDManager exclusive-open does) — in reality,
+   NOLEGACY only suppresses legacy WM_MOUSEMOVE/WM_*BUTTONDOWN *messages*
+   to other windows; it does not touch the separate, lower-level mechanism
+   that actually renders/moves the cursor. There is no supported
+   per-device way to fix this on Windows: the system cursor is a single
+   resource shared by every connected mouse, and the only APIs that
+   pin/hide it (ClipCursor/ShowCursor) act on that shared cursor, not on
+   any one device — using them here would also freeze/hide the cursor for
+   every *other* mouse on the machine, which was tested and explicitly
+   rejected for that reason. This is deliberately NOT implemented; the
+   Expert Mouse simply continues to behave as a normal pointer (visually)
+   alongside delivering jog data — item 1 above is what keeps *other*
+   mice's movement from being mistaken for jog input, this item is purely
+   about the Expert Mouse's own on-screen cursor behavior, which is
+   unaffected either way. If a genuine future need for true per-device
+   cursor detachment on Windows comes up, the real fix is a driver swap
+   (e.g. via Zadig/WinUSB) so Windows never binds the inbox HID-mouse
+   driver to this device at all, paired with a rewrite of this module to
+   talk WinUSB directly instead of Raw Input — a significantly bigger
+   effort than anything here, not started. The actual long-term plan for
+   true per-device detachment is Linux (see backend_factory.py's TODO /
+   CLAUDE.md's open items): evdev's EVIOCGRAB ioctl genuinely does support
+   single-device exclusive grab, unlike anything Windows offers.
 
 See win32_translate.py for how Windows' already-parsed RAWMOUSE data gets
 turned back into the same 4-byte report format report_parser.py expects on
@@ -380,6 +394,33 @@ def list_raw_input_mice() -> list[HidDeviceInfo]:
     return devices
 
 
+def _find_device_handle(name: str) -> wintypes.HANDLE | None:
+    """Resolve a device's RIDI_DEVICENAME path string (HidDeviceInfo.path,
+    as returned by list_raw_input_mice()) back to its current hDevice
+    handle. RegisterRawInputDevices/RIDEV_INPUTSINK registers for the whole
+    Mouse usage class - there is no way to register for a single device -
+    so this handle is what open()/_handle_wm_input() use to actually
+    filter WM_INPUT events down to just the one selected device. Without
+    this, every mouse on the machine (confirmed on real hardware: the
+    system's other, unrelated mouse) drives jog input too.
+    """
+    count = wintypes.UINT(0)
+    if user32.GetRawInputDeviceList(None, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST)) == 0xFFFFFFFF:
+        return None
+    if count.value == 0:
+        return None
+    device_list = (RAWINPUTDEVICELIST * count.value)()
+    if user32.GetRawInputDeviceList(device_list, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST)) == 0xFFFFFFFF:
+        return None
+    for i in range(count.value):
+        entry = device_list[i]
+        if entry.dwType != RIM_TYPEMOUSE:
+            continue
+        if _get_device_name(entry.hDevice) == name:
+            return entry.hDevice
+    return None
+
+
 class Win32RawInputBackend:
     """HidBackend implementation using Windows' Raw Input API. See the
     module docstring for why this exists instead of using `hidapi` here
@@ -388,6 +429,7 @@ class Win32RawInputBackend:
 
     def __init__(self) -> None:
         self._device_path: str | None = None
+        self._device_handle: wintypes.HANDLE | None = None
         self._reports: "queue.Queue[bytes]" = queue.Queue()
         self._button_state = ButtonStateTracker()
         self._hwnd: wintypes.HWND | None = None
@@ -402,7 +444,11 @@ class Win32RawInputBackend:
     def open(self, device: HidDeviceInfo) -> None:
         if self._thread is not None:
             raise RuntimeError("device already open; call close() first")
+        handle = _find_device_handle(device.path)
+        if handle is None:
+            raise OSError(f"raw input device not found (may have been unplugged): {device.path!r}")
         self._device_path = device.path
+        self._device_handle = handle
         self._thread = threading.Thread(target=self._message_loop, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5.0):
@@ -451,6 +497,12 @@ class Win32RawInputBackend:
             return
         raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
         if raw.header.dwType != RIM_TYPEMOUSE:
+            return
+        if raw.header.hDevice != self._device_handle:
+            # RIDEV_INPUTSINK registers for the whole Mouse usage class, not
+            # just the selected device - every other mouse on the machine
+            # (confirmed on real hardware: a separate main PC mouse) also
+            # generates WM_INPUT here and must be filtered out.
             return
 
         mouse = raw.data.mouse
