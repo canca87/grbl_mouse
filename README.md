@@ -40,17 +40,23 @@ specifically needed real platform-specific work, not just "it should work the sa
 > OS pointer pipeline for free) does *not* work on Windows — the device keeps working as
 > a normal system mouse the whole time, and reading it concurrently can fail outright.
 > Windows uses a different mechanism entirely
-> ([win32_raw_input_backend.py](src/grbl_mouse/hid_input/win32_raw_input_backend.py),
+> ([win32_raw_input_backend.py](src/grbl_mouse/hid_input/win32_raw_input_backend.py)),
 > the Raw Input API with `RIDEV_NOLEGACY`, exactly as this project's original brief
-> specified), written and reasoned through from a bug report alone — **no Windows
-> machine was available to test any of it**. If jog input looks wrong on Windows (wrong
-> button, wrong direction, Z-axis way too sensitive or dead), that module's docstring
-> and [win32_translate.py](src/grbl_mouse/hid_input/win32_translate.py)'s docstring both
-> document the specific unverified assumptions to check first. Set
-> `GRBL_MOUSE_WIN32_DEBUG=1` to print raw pre-translation data to stderr. Also note:
-> `RIDEV_NOLEGACY` affects the whole Mouse usage class, not just this device — while the
-> app is running, *every* mouse on the system loses normal pointer behavior, not only
-> the target Expert Mouse.
+> specified. Hardware-confirmed via a standalone diagnostic probe: device detection,
+> button mapping, and wheel scaling are all correct. **Known limitation, by design**:
+> `RIDEV_NOLEGACY` does not actually stop the OS from also treating the Expert Mouse as
+> a normal system pointer — real testing showed the cursor keeps moving/clicking the
+> whole time jog data is also being captured correctly. There's no supported per-device
+> fix for this on Windows (the APIs that pin/hide the cursor act on the single shared
+> system cursor, not per-device, and would affect every other connected mouse too — this
+> was tested and deliberately rejected). Workaround: keep the Expert Mouse away from
+> anything clickable while jogging; this doesn't affect motion safety, since jog
+> commands still require the separate `--confirm-motion` gate regardless. If jog input
+> looks wrong in some other way (wrong direction, Z-axis way too sensitive or dead),
+> that module's docstring and
+> [win32_translate.py](src/grbl_mouse/hid_input/win32_translate.py)'s docstring cover
+> what's been verified vs. still assumed. Set `GRBL_MOUSE_WIN32_DEBUG=1` to print raw
+> pre-translation data to stderr.
 
 - **HID layer** ([hid_input/](src/grbl_mouse/hid_input/)): Kensington Expert Mouse
   (VID=0x047d PID=0x1020) confirmed; it exposes two HID collections sharing the same

@@ -27,11 +27,19 @@ Architecture:
     `win32_translate.py` is the pure, unit-tested translation of Windows'
     already-semantically-parsed `RAWMOUSE` data back into the same 4-byte report format
     `report_parser.py` expects everywhere else; `win32_raw_input_backend.py` is the
-    ctypes/Win32 plumbing around it, which — being genuinely untestable without a
-    Windows machine — carries real unverified assumptions (button-bit mapping, wheel
-    scaling) documented in its own docstring. **`RIDEV_NOLEGACY` affects the whole
-    Mouse usage class, not just this device** — while this backend is open, every mouse
-    on the system loses normal pointer behavior, not only the target Expert Mouse.
+    ctypes/Win32 plumbing around it. Hardware-confirmed (via a standalone .NET Raw Input
+    probe, independent of this code): device enumeration, button-bit mapping, and
+    wheel-delta scaling are all correct — see that module's docstring for what was
+    actually found and fixed (a real bug: Windows classifies HID mice as
+    `RIM_TYPEMOUSE`, whose info struct has no VID/PID field at all — that has to be
+    parsed from the device name string instead). **`RIDEV_NOLEGACY` does NOT detach the
+    device from the OS pointer pipeline** — confirmed on real hardware, the Expert Mouse
+    keeps working as a normal system pointer the whole time, alongside delivering
+    correct jog data. This is a deliberate, accepted tradeoff (see that module's
+    docstring for why the alternative — `ClipCursor`/`ShowCursor` — was rejected: those
+    act on the single shared system cursor, not per-device, and would have frozen every
+    *other* mouse on the machine too). Not yet verified: jog dispatch (`$J=` sending)
+    through the compiled `.exe` end-to-end with motion enabled.
 - `src/grbl_mouse/grbl_link/` — serial connection handling (`transport.py` protocol +
   `pyserial_transport.py`), GRBL response parsing (`serial_link.py`: `ok`/`error`/
   `ALARM`/a mid-session reset), status queries (`status.py`), jog command dispatch
@@ -140,15 +148,30 @@ a second backend behind the same interface, not a rewrite of anything that calls
 ## Open items
 
 - Linux has no dedicated HID backend yet — falls back to `hidapi_backend.py` (same as
-  macOS), unverified on real Linux hardware. If it turns out to have the same
-  driver-contention problem Windows did, it'll need its own backend behind
-  `backend_factory.py` too, same pattern as `win32_raw_input_backend.py`.
-- The Windows Raw Input backend (`win32_raw_input_backend.py`) was written with zero
-  Windows access at all — no machine to test on, ever. Its own docstring and
-  `win32_translate.py`'s docstring both document the specific unverified assumptions
-  (button-bit mapping, wheel-delta scaling) in detail; check those first if Windows
-  behavior looks wrong. `GRBL_MOUSE_WIN32_DEBUG=1` prints raw pre-translation data to
-  help diagnose which assumption is off in one test pass rather than several.
+  macOS), unverified on real Linux hardware. Likely has the same driver-contention
+  problem Windows did (opening `hidraw` doesn't detach a device from the desktop's
+  cursor pipeline by default either). The planned real fix, once Linux hardware is
+  available to test against: keep reading jog data from `/dev/hidrawX` exactly like
+  macOS (same 4-byte report format, no translation layer needed, unlike Windows), and
+  separately open that same physical device's sibling `/dev/input/eventX` node purely
+  to call the `EVIOCGRAB` ioctl on it — a genuine per-device exclusive grab that Windows
+  has no equivalent of (see the Windows dual-pointer note below). Needs its own backend
+  behind `backend_factory.py`, same pattern as `win32_raw_input_backend.py`, and
+  correlating the two device nodes for the same physical device via sysfs.
+- Windows (`win32_raw_input_backend.py`): enumeration, button-bit mapping, and
+  wheel-delta scaling are now hardware-confirmed correct (see that module's docstring).
+  **Known, accepted limitation**: the Expert Mouse continues to behave as a normal
+  system pointer on Windows the whole time it's also delivering jog data — Windows has
+  no supported per-device way to stop this (`RIDEV_NOLEGACY` doesn't touch cursor
+  rendering; `ClipCursor`/`ShowCursor` act on the single shared system cursor and would
+  affect every other connected mouse too, tested and explicitly rejected for that
+  reason). If a genuine future need for true per-device detachment on Windows comes up,
+  the real fix is a driver swap (e.g. via Zadig/WinUSB) away from the inbox HID-mouse
+  driver, paired with rewriting this module around WinUSB instead of Raw Input — a much
+  bigger effort, not started. `GRBL_MOUSE_WIN32_DEBUG=1` prints raw pre-translation data
+  if something still looks off. Not yet verified: jog dispatch (`$J=` sending) through
+  the compiled `.exe` end-to-end with motion enabled — only read-only HID capture has
+  been hardware-tested on Windows so far.
 - Cross-platform packaging (PyInstaller + GitHub Actions) builds successfully
   (verified with a local macOS build) but is otherwise unverified — no Windows/Linux
   hardware has been available to test the resulting binaries against real devices.

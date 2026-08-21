@@ -15,18 +15,43 @@ anticipated exactly this, specifying RegisterRawInputDevices with
 RIDEV_NOLEGACY as the Windows-specific mechanism — which is what this
 module implements.
 
-Important, non-obvious limitation: RIDEV_NOLEGACY operates per HID usage
-class (Generic Desktop Page / Mouse), not per specific device — while this
-backend is open, ALL mice on the system (not just the target Expert
-Mouse) stop generating normal system-pointer movement, since Windows has
-no native way to seize just one device of a given class. This matches
-what the original brief specified, but is a real, user-visible side
-effect worth knowing about.
+Important, hardware-confirmed limitation: RIDEV_NOLEGACY does NOT stop the
+Expert Mouse from also continuing to work as a normal system pointer while
+this backend is open — real hardware testing (a standalone .NET Raw Input
+probe, independent of this module) showed the on-screen cursor keeps
+moving and clicking normally the whole time raw jog data is also being
+captured correctly. This contradicts what the docs originally assumed
+(that NOLEGACY would detach the device the way macOS's IOHIDManager
+exclusive-open does) — in reality, NOLEGACY only suppresses legacy
+WM_MOUSEMOVE/WM_*BUTTONDOWN *messages* to other windows; it does not touch
+the separate, lower-level mechanism that actually renders/moves the
+cursor. There is no supported per-device way to fix this on Windows: the
+system cursor is a single resource shared by every connected mouse, and
+the only APIs that pin/hide it (ClipCursor/ShowCursor) act on that shared
+cursor, not on any one device — using them here would also freeze/hide
+the cursor for every *other* mouse on the machine, which was tested and
+explicitly rejected for that reason. This is deliberately NOT implemented;
+the Expert Mouse simply continues to behave as a normal pointer alongside
+delivering jog data, and other connected mice are completely unaffected.
+If a genuine future need for true per-device detachment on Windows comes
+up, the real fix is a driver swap (e.g. via Zadig/WinUSB) so Windows never
+binds the inbox HID-mouse driver to this device at all, paired with a
+rewrite of this module to talk WinUSB directly instead of Raw Input — a
+significantly bigger effort than anything here, not started. The actual
+long-term plan for true per-device detachment is Linux (see
+backend_factory.py's TODO / CLAUDE.md's open items): evdev's EVIOCGRAB
+ioctl genuinely does support single-device exclusive grab, unlike
+anything Windows offers.
 
 See win32_translate.py for how Windows' already-parsed RAWMOUSE data gets
 turned back into the same 4-byte report format report_parser.py expects on
-every platform, and for the specific assumptions (button mapping, wheel
-scaling) that are UNVERIFIED against real Windows hardware.
+every platform. The button-bit mapping and wheel-delta scaling assumptions
+documented there are now hardware-confirmed correct (verified via the same
+standalone Raw Input probe: all 4 buttons produced the expected up/down
+flags, one wheel detent produced the expected ±120 delta). What remains
+unverified on real hardware is jog dispatch through the compiled
+PyInstaller .exe end-to-end (motion-enabled) — enumeration and raw input
+decode are now confirmed, actual `$J=` sending has not been.
 
 Set the GRBL_MOUSE_WIN32_DEBUG=1 environment variable to print each raw
 RAWMOUSE event (before translation) to stderr, to speed up diagnosing a
@@ -47,6 +72,7 @@ if sys.platform != "win32":
 import ctypes
 import os
 import queue
+import re
 import threading
 from ctypes import wintypes
 
@@ -62,7 +88,6 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 RIDEV_INPUTSINK = 0x00000100
 RIDEV_NOLEGACY = 0x00000030
 RID_INPUT = 0x10000003
-RIDI_DEVICEINFO = 0x2000000B
 RIDI_DEVICENAME = 0x20000007
 RIM_TYPEMOUSE = 0
 RIM_TYPEKEYBOARD = 1
@@ -75,6 +100,12 @@ HWND_MESSAGE = wintypes.HWND(-3)
 
 HID_USAGE_PAGE_GENERIC = 0x01
 HID_USAGE_GENERIC_MOUSE = 0x02
+
+# GetRawInputDeviceInfo(RIDI_DEVICENAME) device path, e.g.
+# \\?\HID#VID_047D&PID_1020&...#{...}. For RIM_TYPEMOUSE devices this path
+# string is the ONLY source of VID/PID - see the note on _DEVICE_NAME_VID_PID_RE
+# below for why the RIDI_DEVICEINFO struct can't be used instead.
+_DEVICE_NAME_VID_PID_RE = re.compile(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})")
 
 
 # --- structs (winuser.h) ---
@@ -146,53 +177,6 @@ class RAWINPUT(ctypes.Structure):
     ]
 
 
-class RID_DEVICE_INFO_MOUSE(ctypes.Structure):
-    _fields_ = [
-        ("dwId", wintypes.DWORD),
-        ("dwNumberOfButtons", wintypes.DWORD),
-        ("dwSampleRate", wintypes.DWORD),
-        ("fHasHorizontalWheel", wintypes.BOOL),
-    ]
-
-
-class RID_DEVICE_INFO_KEYBOARD(ctypes.Structure):
-    _fields_ = [
-        ("dwType", wintypes.DWORD),
-        ("dwSubType", wintypes.DWORD),
-        ("dwKeyboardMode", wintypes.DWORD),
-        ("dwNumberOfFunctionKeys", wintypes.DWORD),
-        ("dwNumberOfIndicators", wintypes.DWORD),
-        ("dwNumberOfKeysTotal", wintypes.DWORD),
-    ]
-
-
-class RID_DEVICE_INFO_HID(ctypes.Structure):
-    _fields_ = [
-        ("dwVendorId", wintypes.DWORD),
-        ("dwProductId", wintypes.DWORD),
-        ("dwVersionNumber", wintypes.DWORD),
-        ("usUsagePage", wintypes.USHORT),
-        ("usUsage", wintypes.USHORT),
-    ]
-
-
-class _RID_DEVICE_INFO_UNION(ctypes.Union):
-    _fields_ = [
-        ("mouse", RID_DEVICE_INFO_MOUSE),
-        ("keyboard", RID_DEVICE_INFO_KEYBOARD),
-        ("hid", RID_DEVICE_INFO_HID),
-    ]
-
-
-class RID_DEVICE_INFO(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("dwType", wintypes.DWORD),
-        ("u", _RID_DEVICE_INFO_UNION),
-    ]
-
-
 class RAWINPUTDEVICELIST(ctypes.Structure):
     _fields_ = [
         ("hDevice", wintypes.HANDLE),
@@ -232,14 +216,86 @@ WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND, wintypes.UINT, wi
 _WINDOW_CLASS_NAME = "GrblMouseRawInputWindow"
 
 
-def _get_device_hid_info(hdevice: wintypes.HANDLE) -> RID_DEVICE_INFO | None:
-    info = RID_DEVICE_INFO()
-    info.cbSize = ctypes.sizeof(RID_DEVICE_INFO)
-    size = wintypes.UINT(ctypes.sizeof(RID_DEVICE_INFO))
-    result = user32.GetRawInputDeviceInfoW(hdevice, RIDI_DEVICEINFO, ctypes.byref(info), ctypes.byref(size))
-    if result == 0 or result == 0xFFFFFFFF:
-        return None
-    return info
+# --- explicit argtypes/restype for every WinAPI call used below ---
+#
+# ctypes defaults to interpreting a function's return value as a SIGNED
+# 32-bit int unless told otherwise. Several of these functions return UINT
+# and signal errors with (UINT)-1 (0xFFFFFFFF) - left at ctypes' default,
+# that comes back to Python as -1, not 0xFFFFFFFF, so a naive
+# `if result == 0xFFFFFFFF` check silently never fires, and a real error
+# return gets treated as success with whatever garbage was left in the
+# output buffer. This was found to be the actual cause of a real "device
+# is physically present but never found" bug report - explicit restype is
+# what makes the 0xFFFFFFFF checks below actually work.
+user32.GetRawInputDeviceList.argtypes = [
+    ctypes.POINTER(RAWINPUTDEVICELIST),
+    ctypes.POINTER(wintypes.UINT),
+    wintypes.UINT,
+]
+user32.GetRawInputDeviceList.restype = wintypes.UINT
+
+user32.GetRawInputDeviceInfoW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.UINT,
+    ctypes.c_void_p,
+    ctypes.POINTER(wintypes.UINT),
+]
+user32.GetRawInputDeviceInfoW.restype = wintypes.UINT
+
+user32.GetRawInputData.argtypes = [
+    wintypes.HANDLE,
+    wintypes.UINT,
+    ctypes.c_void_p,
+    ctypes.POINTER(wintypes.UINT),
+    wintypes.UINT,
+]
+user32.GetRawInputData.restype = wintypes.UINT
+
+user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT]
+user32.RegisterRawInputDevices.restype = wintypes.BOOL
+
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.RegisterClassW.restype = wintypes.WORD  # ATOM, 0 on failure
+
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.HANDLE,  # HMENU - same ABI as HANDLE, avoids depending on wintypes.HMENU existing
+    wintypes.HINSTANCE,
+    ctypes.c_void_p,
+]
+user32.CreateWindowExW.restype = wintypes.HWND
+
+user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
+user32.PostQuitMessage.restype = None
+
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
+
+user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = ctypes.c_int  # genuinely a signed 3-way result (-1/0/nonzero) per docs
+
+user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
+
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 
 def _get_device_name(hdevice: wintypes.HANDLE) -> str:
@@ -253,36 +309,72 @@ def _get_device_name(hdevice: wintypes.HANDLE) -> str:
 
 
 def list_raw_input_mice() -> list[HidDeviceInfo]:
-    """Enumerate connected Raw Input devices, filtered to HID-type devices
-    recognized as a mouse (matching what report_parser.py/app.py expect —
-    usage_page=0x0001 usage=0x0002). Unlike hidapi on macOS/Linux, Raw
-    Input doesn't expose HID string descriptors, so product_string/
+    """Enumerate connected Raw Input devices, filtered to devices Windows
+    classifies as RIM_TYPEMOUSE (matching what report_parser.py/app.py
+    expect — usage_page=0x0001 usage=0x0002). Unlike hidapi on macOS/Linux,
+    Raw Input doesn't expose HID string descriptors, so product_string/
     manufacturer_string/serial_number are always None here.
+
+    VID/PID come from parsing the RIDI_DEVICENAME device path string
+    (`\\\\?\\HID#VID_047D&PID_1020&...`), NOT from GetRawInputDeviceInfo's
+    RID_DEVICE_INFO struct. This was a real bug found via hardware testing:
+    that struct is a union keyed by dwType, and for RIM_TYPEMOUSE devices
+    (which is how Windows classifies ALL HID-class mice, not just non-mouse
+    HID devices) the populated member is RID_DEVICE_INFO_MOUSE — id/button
+    count/sample rate, no VID/PID field at all. Reading `.hid.dwVendorId`
+    off a mouse-type device silently reinterprets those unrelated fields as
+    VID/PID, producing plausible-looking but wrong values (confirmed via a
+    standalone .NET probe script: a real Expert Mouse enumerated as
+    RIM_TYPEMOUSE with garbage VID instead of 0x047D), so the VID/PID
+    device-selection filter in app.py/cli_common.py silently matched
+    nothing on real hardware. Since usage_page/usage for a RIM_TYPEMOUSE
+    device is definitionally Generic Desktop/Mouse, those are set directly
+    rather than read from the struct too.
     """
     count = wintypes.UINT(0)
-    user32.GetRawInputDeviceList(None, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST))
-    if count.value == 0:
+    first_result = user32.GetRawInputDeviceList(None, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST))
+    if _DEBUG:
+        print(
+            f"[win32 raw input] GetRawInputDeviceList(size query) result={first_result} "
+            f"count={count.value} last_error={ctypes.get_last_error()}",
+            file=sys.stderr,
+        )
+    if first_result == 0xFFFFFFFF or count.value == 0:
         return []
     device_list = (RAWINPUTDEVICELIST * count.value)()
     written = user32.GetRawInputDeviceList(device_list, ctypes.byref(count), ctypes.sizeof(RAWINPUTDEVICELIST))
+    if _DEBUG:
+        print(
+            f"[win32 raw input] GetRawInputDeviceList(fetch) written={written} last_error={ctypes.get_last_error()}",
+            file=sys.stderr,
+        )
     if written == 0xFFFFFFFF:
         return []
 
     devices: list[HidDeviceInfo] = []
     for i in range(written):
         entry = device_list[i]
+        if _DEBUG:
+            print(f"[win32 raw input] device[{i}]: dwType={entry.dwType}", file=sys.stderr)
         if entry.dwType != RIM_TYPEMOUSE:
             continue
-        info = _get_device_hid_info(entry.hDevice)
-        if info is None:
+        name = _get_device_name(entry.hDevice)
+        match = _DEVICE_NAME_VID_PID_RE.search(name)
+        if _DEBUG:
+            print(
+                f"[win32 raw input] device[{i}]: name={name!r} "
+                f"vid_pid_match={match.groups() if match else None}",
+                file=sys.stderr,
+            )
+        if match is None:
             continue
         devices.append(
             HidDeviceInfo(
-                vendor_id=info.hid.dwVendorId,
-                product_id=info.hid.dwProductId,
-                path=_get_device_name(entry.hDevice) or f"raw-input-handle-{int(entry.hDevice)}",
-                usage_page=info.hid.usUsagePage,
-                usage=info.hid.usUsage,
+                vendor_id=int(match.group(1), 16),
+                product_id=int(match.group(2), 16),
+                path=name,
+                usage_page=HID_USAGE_PAGE_GENERIC,
+                usage=HID_USAGE_GENERIC_MOUSE,
             )
         )
     return devices
@@ -389,11 +481,15 @@ class Win32RawInputBackend:
         wndclass.lpfnWndProc = ctypes.cast(wndproc, ctypes.c_void_p)
         wndclass.hInstance = kernel32.GetModuleHandleW(None)
         wndclass.lpszClassName = _WINDOW_CLASS_NAME
-        user32.RegisterClassW(ctypes.byref(wndclass))
+        atom = user32.RegisterClassW(ctypes.byref(wndclass))
+        if _DEBUG:
+            print(f"[win32 raw input] RegisterClassW atom={atom} last_error={ctypes.get_last_error()}", file=sys.stderr)
 
         hwnd = user32.CreateWindowExW(
             0, _WINDOW_CLASS_NAME, "grbl_mouse raw input", 0, 0, 0, 0, 0, HWND_MESSAGE, None, wndclass.hInstance, None
         )
+        if _DEBUG:
+            print(f"[win32 raw input] CreateWindowExW hwnd={hwnd} last_error={ctypes.get_last_error()}", file=sys.stderr)
         if not hwnd:
             self._ready.set()
             return
@@ -405,7 +501,13 @@ class Win32RawInputBackend:
             dwFlags=RIDEV_NOLEGACY | RIDEV_INPUTSINK,
             hwndTarget=hwnd,
         )
-        user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        registered = user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        if _DEBUG:
+            print(
+                f"[win32 raw input] RegisterRawInputDevices ok={bool(registered)} "
+                f"last_error={ctypes.get_last_error()}",
+                file=sys.stderr,
+            )
 
         self._ready.set()
 
